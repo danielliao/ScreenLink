@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>ScreenLink</string>
+  <key>CFBundleIdentifier</key><string>local.screenlink.app</string>
+  <key>CFBundleName</key><string>ScreenLink</string>
+  <key>CFBundleDisplayName</key><string>ScreenLink</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.3.0</string>
+  <key>CFBundleVersion</key><string>14</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSBluetoothAlwaysUsageDescription</key><string>ScreenLink 检测你选定的 iPhone 是否在附近，用于离开后的多台 Mac 联动锁屏。</string>
+  <key>NSBluetoothPeripheralUsageDescription</key><string>观察选定 iPhone 的蓝牙信号和连接状态。</string>
+  <key>NSLocalNetworkUsageDescription</key><string>ScreenLink 在局域网内发现并控制你配对的其他 Mac。</string>
+  <key>NSBonjourServices</key><array><string>_screenlink._tcp</string><string>_screenjoin._tcp</string></array>
+</dict></plist>

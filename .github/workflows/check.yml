@@ -1,0 +1,22 @@
+name: macOS checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check core, event construction and app build
+        run: bash scripts/check.sh
+      - name: Build arm64 app bundle
+        run: bash scripts/build-app.sh
+      - name: Verify signed bundle
+        run: codesign --verify --deep --strict dist/ScreenLink.app

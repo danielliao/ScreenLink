@@ -1,0 +1,14 @@
+.build/
+dist/
+.swiftpm/
+.DS_Store
+.local-notes/
+.env
+.env.*
+!.env.example
+*.ips
+*.log
+*.p12
+*.pfx
+*.key
+*.mobileprovision
