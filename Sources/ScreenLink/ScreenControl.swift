@@ -21,23 +21,31 @@ enum ScreenControl {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
     }
-    static func key(_ code: CGKeyCode, flags: CGEventFlags = []) {
-        let source = CGEventSource(stateID: .hidSystemState)
-        for down in [true, false] {
-            let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down)
-            event?.flags = flags
-            event?.post(tap: .cghidEventTap)
-        }
-    }
     static func lock(completion: @escaping (String) -> Void) {
-        if state == .locked { completion("已锁定"); return }
-        guard accessibility else { completion("未锁屏：需要辅助功能权限"); return }
-        guard state == .unlocked else { completion("未锁屏：无法确认当前控制台会话"); return }
-        key(12, flags: [.maskControl, .maskCommand])
+        lockOnce { completion($0.note) }
+    }
+    static func lockOnce(completion: @escaping (LockResult) -> Void) {
+        if state == .locked { completion(.locked); return }
+        guard accessibility else { completion(.blocked("未锁屏：需要辅助功能权限")); return }
+        guard CGPreflightPostEventAccess() else {
+            completion(.blocked("未锁屏：系统不允许发送输入事件，请重新授权当前 ScreenLink")); return
+        }
+        guard state == .unlocked else {
+            completion(.retryable("未锁屏：暂时无法确认当前控制台会话")); return
+        }
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let down = CGEvent(keyboardEventSource: source, virtualKey: 12, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: 12, keyDown: false) else {
+            completion(.blocked("未锁屏：无法创建锁屏输入事件")); return
+        }
+        down.flags = [.maskControl, .maskCommand]
+        up.flags = []
+        down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap)
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-            completion(state == .locked ? "已锁定" : "已发送锁屏快捷键，但未确认锁定")
+            completion(state == .locked ? .locked : .retryable("已发送锁屏快捷键，但未确认锁定"))
         }
     }
+
 }
 
 final class IdleDisplayGuard {

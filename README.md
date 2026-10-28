@@ -4,7 +4,7 @@ A native macOS menu bar app for coordinating lock screens across your own Macs, 
 
 轻量原生多 Mac 联动锁屏工具。选择一台主控，通过局域网管理自己的其他 Mac；可选 iPhone 蓝牙在场检测，无需安装 iPhone App。
 
-**当前版本：0.3.0，实验阶段。** 支持 macOS 14+；当前打包脚本面向 Apple Silicon。界面以中文为主。密码输入式解锁依赖系统权限、钥匙串访问和锁屏状态，尚未完成所有机型与系统版本的验证。
+**当前版本：0.3.1，实验阶段。** 支持 macOS 14+；当前打包脚本面向 Apple Silicon。界面以中文为主。密码输入式解锁依赖系统权限、钥匙串访问和锁屏状态，尚未完成所有机型与系统版本的验证。
 
 ## 功能
 
@@ -27,7 +27,7 @@ bash scripts/check.sh
 bash scripts/build-app.sh
 ```
 
-产物为 `dist/ScreenLink.app` 和 `dist/ScreenLink-0.3.0-arm64.zip`。退出旧版本后，将 App 放入 `/Applications` 再启动。
+产物为 `dist/ScreenLink.app` 和 `dist/ScreenLink-0.3.1-arm64.zip`。退出旧版本后，将 App 放入 `/Applications` 再启动。
 
 默认使用 ad-hoc 签名，**没有 Apple 公证**。来自下载的构建可能被 Gatekeeper 拦截；确认来源后，通过“系统设置 → 隐私与安全性 → 仍要打开”处理。请勿将 `codesign --verify` 成功等同于 Apple 公证。正式分发可使用自己的 Developer ID：
 

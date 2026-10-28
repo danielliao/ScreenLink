@@ -22,6 +22,14 @@ The coordinator observes a selected BLE peripheral UUID, optionally connecting a
 
 Return unlock requires fresh connected RSSI, above the departure threshold plus 5 dB when configured. It fires on the first qualifying sample or on return after the absence timeout. Short reconnects and continuous samples do not repeat. Pending phone authorization expires or is canceled when configuration, session or connection state changes. Authenticated peer identities are deduplicated before commands are sent.
 
+## Local lock recovery
+
+Coordinator lock requests verify the observed console state. Transient failures permit at most three attempts, with a one-second gap after each unsuccessful check; each posted shortcut is checked after two seconds. Missing input permissions stop immediately. A replaced request, settings change, shutdown, observed lock, or an authorized unlock invalidates queued work. For phone departure, renewed presence also prevents further attempts. Failures remain visible in the device list and recent events. Remote lock requests retain their existing single-attempt reply behavior.
+
+Before system sleep, an enabled coordinator requests both local and peer locks. Sleep notifications cannot guarantee enough execution time to finish, so wake starts a fresh local confirmation cycle. Presence suspends without granting an awake lease; a previously seen phone receives a new configured absence grace period after wake. A fresh sample supersedes that deadline. A phone never seen remains unarmed. Presence and Bluetooth polling timers use common run-loop modes to continue during menu tracking.
+
+These are bounded recovery measures, not a guarantee of locking when macOS refuses input. Password entry is never retried.
+
 ## Credentials and unlock
 
 A native NSSecureTextField captures input without retaining it in SwiftUI state. OpenDirectory verifies the current user's password against `/Local/Default` once; only success permits writing the local Keychain. Passwords are neither trimmed nor normalized. Password and group key remain in separate accounts under `local.screenlink.credentials`.

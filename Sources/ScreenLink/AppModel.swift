@@ -37,6 +37,7 @@ final class AppModel: NSObject, ObservableObject {
     @Published var hasKey = false
     @Published var hasPassword = false
     @Published var unlockSetupStatus = ""
+    @Published var localLockStatus = "尚无锁屏请求"
     @Published var operationInProgress = false
     @Published var lastSignalText = "尚无有效信号"
     @Published var rssi: Int?
@@ -54,6 +55,9 @@ final class AppModel: NSObject, ObservableObject {
     private var discoveryProblem: String?
     private let idle = IdleDisplayGuard()
     private let unlocker = ExperimentalUnlocker()
+    private let locker = LockRetrier(state: { ScreenControl.state }, attempt: ScreenControl.lockOnce)
+    private var isSleeping = false
+    private var pendingSleepLock = false
     private var browser: NWBrowser?
     private var key: Data?
     private var timer: Timer?
@@ -84,6 +88,10 @@ final class AppModel: NSObject, ObservableObject {
         hasPassword = UserDefaults.standard.bool(forKey: "hasLocalPassword")
         screen = ScreenControl.state
         unlocker.onProgress = { [weak self] in self?.record("实验解锁步骤：" + $0) }
+        locker.onRetry = { [weak self] number in
+            self?.localLockStatus = "本机未确认锁定，准备第 \(number)/3 次尝试"
+            if let note = self?.localLockStatus { self?.record(note) }
+        }
         bluetooth.onDevices = { [weak self] in self?.nearby = $0 }
         bluetooth.onStatus = { [weak self] in self?.bluetoothStatus = $0 }
         bluetooth.onSignal = { [weak self] value in
@@ -97,7 +105,7 @@ final class AppModel: NSObject, ObservableObject {
         bluetooth.onConnectionLost = { [weak self] in self?.phoneReturn.disconnected() }
         bluetooth.onConnectedSignal = { [weak self] value in
             guard let self else { return }
-            guard self.settings.isCoordinator, self.settings.phoneUnlockEnabled,
+            guard !self.isSleeping, self.settings.isCoordinator, self.settings.phoneUnlockEnabled,
                   !self.settings.passiveBLE, self.settings.acceptsUnlockSignal(value) else {
                 self.phoneReturn.disconnected(); return
             }
@@ -139,22 +147,36 @@ final class AppModel: NSObject, ObservableObject {
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
-            if self.settings.isCoordinator && (self.settings.autoLock || self.settings.relayManualLock) {
-                self.broadcast(.lock, reason: "主控即将休眠（发送不保证完成）")
+            self.pendingSleepLock = self.settings.isCoordinator && (self.settings.autoLock || self.settings.relayManualLock)
+            self.locker.cancel()
+            if self.pendingSleepLock {
+                self.lockAll(reason: "主控即将休眠（唤醒后核对本机锁屏结果）")
             }
+            self.isSleeping = true
             self.cancelPendingUnlocks(); self.idle.set(false); self.remotePresenceUntil = 0
             self.phoneReturn = PhoneReturnPolicy(timeout: self.settings.signalTimeout)
-            self.presence.reset(); self.isPresent = false
+            self.presence.suspend(); self.isPresent = false
             self.joinServer.stop(); self.joinClient?.cancel()
             self.joinServiceStatus = "系统休眠，加入服务暂停"
         })
         observers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.presence.reset(); self?.remotePresenceUntil = 0
-            self?.configureJoining()
-            self?.record("已唤醒，等待新的手机信号")
+            guard let self else { return }
+            self.isSleeping = false
+            self.locker.cancel()
+            self.presence.resume(at: self.uptime); self.remotePresenceUntil = 0
+            if self.pendingSleepLock, self.settings.isCoordinator,
+               self.settings.autoLock || self.settings.relayManualLock {
+                self.requestLocalLock(phoneDeparture: false)
+            }
+            self.pendingSleepLock = false
+            if self.observing {
+                self.bluetooth.start(phone: self.settings.phoneID, passive: self.settings.passiveBLE, listing: false)
+            }
+            self.configureJoining()
+            self.record("已唤醒，恢复手机检测并核对本机锁屏")
         })
         configure()
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
+        timer = CommonModeTimer.schedule(interval: 1) { [weak self] in self?.tick() }
     }
 
     func record(_ message: String) {
@@ -199,6 +221,7 @@ final class AppModel: NSObject, ObservableObject {
         configure(keepJoin: keepJoin)
     }
     private func configure(keepJoin: Bool = false) {
+        locker.cancel(); pendingSleepLock = false
         if !keepJoin { joinClient?.cancel() }
         configureJoining()
         cancelPendingUnlocks()
@@ -395,9 +418,11 @@ final class AppModel: NSObject, ObservableObject {
         record("选定设备：\(phone.name)；请通过离开/返回测试确认是你的 iPhone")
     }
     private func tick() {
+        guard !isSleeping else { return }
         let trusted = ScreenControl.accessibility
         if accessibilityGranted != trusted { accessibilityGranted = trusted }
         let current = ScreenControl.state
+        if current == .locked { locker.observeLocked() }
         if current != screen {
             let previous = screen; screen = current
             if current == .locked {
@@ -411,13 +436,13 @@ final class AppModel: NSObject, ObservableObject {
         }
         if presence.tick(at: uptime), observing {
             record("选定手机持续断连或信号低于阈值，已判定离开")
-            if settings.isCoordinator && settings.autoLock { lockAll(reason: "手机离开") }
+            if settings.isCoordinator && settings.autoLock { lockAll(reason: "手机离开", phoneDeparture: true) }
         }
         if isPresent != presence.isPresent { isPresent = presence.isPresent }
         let text = presence.isPresent ? "手机在场" : (presence.lastSignal == nil ? "等待首次信号" : "手机已离开")
         if presenceText != text { presenceText = text }
         let fresh = settings.isCoordinator ? presence.isPresent : uptime < remotePresenceUntil
-        idle.set(settings.keepAwake && fresh && current == .unlocked)
+        idle.set(settings.keepAwake && fresh && current == .unlocked && !locker.isPending)
         if awakeActive != idle.active { awakeActive = idle.active }
         if settings.isCoordinator, settings.keepAwake, presence.isPresent, current == .unlocked, uptime >= nextLease {
             nextLease = uptime + 5
@@ -465,12 +490,25 @@ final class AppModel: NSObject, ObservableObject {
             send(command, to: target)
         }
     }
-    func lockAll(reason: String = "手动锁定全部") {
+    func lockAll(reason: String = "手动锁定全部", phoneDeparture: Bool = false) {
         cancelPendingUnlocks()
         suppressRelayUntil = uptime + 5
         broadcast(.lock, reason: reason)
         idle.set(false)
-        ScreenControl.lock { [weak self] result in self?.record("本机：\(result)") }
+        requestLocalLock(phoneDeparture: phoneDeparture)
+    }
+    private func requestLocalLock(phoneDeparture: Bool) {
+        // Cancel first so the previous completion cannot overwrite the new status.
+        locker.cancel()
+        localLockStatus = "正在锁定本机…"
+        locker.request(allowed: { [weak self] in
+            guard let self, !self.isSleeping else { return false }
+            return !phoneDeparture || (self.settings.isCoordinator && self.settings.autoLock
+                && self.observing && !self.presence.isPresent)
+        }, completion: { [weak self] result in
+            self?.localLockStatus = result.note
+            self?.record("本机：\(result.note)")
+        })
     }
     func unlockOthers() {
         guard !operationInProgress else { return }
@@ -514,6 +552,7 @@ final class AppModel: NSObject, ObservableObject {
         let authorization = UnlockAuthorization(source: .phone, generation: generation, expires: uptime + 15)
         guard permits(authorization) else { return }
         operationInProgress = true
+        locker.cancel()
         record("手机已连接且信号达标，触发一次全部解锁")
         if ScreenControl.state == .locked {
             unlocker.attempt(enabled: settings.allowRemoteUnlock,
@@ -562,6 +601,7 @@ final class AppModel: NSObject, ObservableObject {
             suppressRelayUntil = uptime + 5; remotePresenceUntil = 0; idle.set(false)
             ScreenControl.lock { result in self.record("收到组内锁屏：\(result)"); respond(result) }
         case .unlock:
+            if settings.allowRemoteUnlock { locker.cancel() }
             unlocker.attempt(enabled: settings.allowRemoteUnlock) { result in
                 self.record("收到组内解锁：\(result)"); respond(result)
             }
@@ -679,6 +719,7 @@ final class AppModel: NSObject, ObservableObject {
         } catch { alert("登录启动设置失败", error.localizedDescription) }
     }
     func shutdown() {
+        locker.cancel()
         cancelPendingUnlocks()
         timer?.invalidate(); bluetooth.stop(); server.stop(); browser?.cancel(); idle.set(false)
         joinBrowser?.cancel(); joinServer.stop(); joinClient?.cancel()

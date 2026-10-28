@@ -60,7 +60,7 @@ struct Dashboard: View {
                             Spacer()
                             Button("刷新状态") { model.refreshPeers() }.disabled(!model.settings.networkEnabled)
                         }
-                        deviceRow(model.settings.deviceName, subtitle: "当前设备", status: AppModel.label(model.screen))
+                        deviceRow(model.settings.deviceName, subtitle: "当前设备", status: "\(AppModel.label(model.screen)) · 最近锁屏请求：\(model.localLockStatus)")
                         ForEach(model.settings.peers) { peer in
                             Divider()
                             deviceRow(peer.name, subtitle: "\(peer.host):\(peer.port)", status: model.results[peer.id.uuidString] ?? "尚未检测")

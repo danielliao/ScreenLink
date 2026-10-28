@@ -89,7 +89,7 @@ final class BluetoothMonitor: NSObject, CBCentralManagerDelegate, CBPeripheralDe
         peripheral = phone; phone.delegate = self
         if phone.state == .disconnected { manager?.connect(phone, options: nil) }
         if polling == nil {
-            polling = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            polling = CommonModeTimer.schedule(interval: 3) { [weak self] in
                 guard let self, self.wanted, self.peripheral?.state == .connected else { return }
                 self.peripheral?.readRSSI()
             }

@@ -4,7 +4,7 @@ Automated checks validate implementation behavior, not Bluetooth reliability or 
 
 ## Automated checks
 
-- `scripts/check.sh`: 117 core checks, including actual loopback TCP exchange, authentication/replay, framing, pairing, listener rebinding, discovery, credential setup ordering, presence and return policies; 18 event-construction checks; app compilation and plist validation.
+- `scripts/check.sh`: 135 core checks, including actual loopback TCP exchange, authentication/replay, framing, pairing, listener rebinding, discovery, credential setup ordering, presence and return policies; 18 event-construction checks; app compilation and plist validation.
 - `scripts/check-prompts.sh`: 15 AppKit dialog/input checks on an interactive desktop.
 - `scripts/check-input.sh`: 6 synthetic SwiftUI input checks on an interactive desktop.
 - `scripts/build-app.sh`: arm64 release build, app bundle and signature verification.
@@ -29,3 +29,9 @@ An earlier macOS 15.0.1 crash in NSAlert's ImageIO/icon-loading path motivated c
 ## Public-source preparation check
 
 On 2026-10-20, 117 core checks, 18 input-event checks and 15 native prompt checks passed locally. Debug and arm64 Release builds succeeded. The extracted 0.3.0 archive passed deep/strict signature verification and contains the project license and attribution files. The 49-file source publication set was checked for local user paths, deployment addresses and common credential patterns, with no findings; this is a bounded scan, not a guarantee that every possible secret pattern is detectable. Existing installed 0.2.9 was left unchanged.
+
+## 0.3.1 lock recovery checks — 2026-10-28
+
+135 core checks, 18 input-event checks and 15 native prompt checks passed locally (168 total). The 18 new recovery checks exercise the production retry controller, suspended presence policy and common-mode timer with simulated state/time and no system input. Three isolated regression mutations (single-attempt locking, discarded wake deadline, default-mode timer) each fail the targeted checks; the fixed implementation passes. Debug build and plist validation passed.
+
+The coordinator sleep-notification wiring was reviewed in source. Automated checks do not suspend the host, lock the desktop, access real credentials or operate the user's other Macs. Real phone-departure locking on the coordinator and followers, wake with the phone absent, and menu-open detection still require device acceptance. The installed application is not replaced by packaging.
