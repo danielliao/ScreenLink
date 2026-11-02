@@ -58,6 +58,21 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                     Toggle("被动蓝牙扫描（连接不稳定时尝试）", isOn: $draft.passiveBLE).disabled(!draft.isCoordinator)
                 }
+                Section("工作台共享") {
+                    Toggle("本机解锁后，自动解锁其他 Mac", isOn: Binding(
+                        get: { draft.relayUnlock ?? false }, set: { draft.relayUnlock = $0 }))
+                    Text("任意一台可发起，由主控联动；目标仍需开启实验解锁。最近 10 秒有鼠标或键盘活动时，暂缓全组自动锁屏。手动锁屏不受影响。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Toggle("同步剪贴板文字与图片", isOn: Binding(
+                        get: { draft.clipboardSync ?? false }, set: { draft.clipboardSync = $0 }))
+                    Text("仅在解锁时加密同步新复制内容；已标记的机密条目跳过。请只与可信设备配对。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Toggle("允许接收组内文件", isOn: Binding(
+                        get: { draft.receiveFiles ?? false }, set: { draft.receiveFiles = $0 }))
+                    Text("接收目录：\(draft.receiveDirectory ?? "下载/ScreenLink")")
+                        .font(.caption).textSelection(.enabled)
+                    Button("选择接收目录…") { if let path = model.chooseReceiveDirectory() { draft.receiveDirectory = path } }
+                }
                 Section("固定地址") {
                     ForEach(draft.peers) { peer in
                         HStack {

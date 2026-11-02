@@ -154,6 +154,11 @@ futurePairing.version = 2
 let futureText = try JSONEncoder().encode(futurePairing).base64EncodedString()
 rejects("Unsupported pairing versions are rejected") { _ = try PairingCode.parse(futureText) }
 
+try runSharingChecks()
+runClipboardChecks()
+try runWorkstationWireChecks()
+runWorkstationChecks()
+runWorkstationEdgeChecks()
 runLockRecoveryChecks()
 runCredentialChecks()
 try runJoinCryptoChecks()

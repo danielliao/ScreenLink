@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 — Workstation sharing
+
+- Add observed manual-unlock relay through the coordinator, with remote-origin suppression and no password retries.
+- Defer automatic locks for mouse/keyboard activity in the preceding ten seconds, including follower activity and secure-input uncertainty; cancel stale automatic commands.
+- Add group pause/resume presets, monotonic restart-safe deadlines and per-device acknowledgement status.
+- Add opt-in encrypted text/image clipboard sharing with duplicate suppression, deterministic ordering and sensitive-type filtering.
+- Add authenticated encrypted streaming file transfer by dropping files on a device or the all-devices area, with progress, cancellation, bounded queues, safe staging and no-clobber publication.
+- Preserve legacy settings and negotiate new control capabilities. All three Macs should upgrade for group automation.
+
 ## 0.3.1 — Local lock recovery
 
 - Confirm local locking and retry transient failures up to three attempts; stop on missing permissions, cancellation, or observed lock. This never retries password entry.

@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import ServiceManagement
 import ScreenLinkCore
 
@@ -53,6 +54,17 @@ struct Dashboard: View {
                 }
                 Text("解锁其他设备需要先正常解锁本机；每台目标 Mac 单独开启实验解锁。未配置的设备不会收到指令。")
                     .font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Menu("暂停自动锁屏") {
+                        ForEach([15, 30, 60, 120], id: \.self) { minutes in
+                            Button("暂停 \(minutes) 分钟") { model.pauseLock(minutes: minutes) }
+                        }
+                        Button("恢复自动锁屏") { model.pauseLock(minutes: 0) }
+                    }
+                    Text(model.pauseStatus).font(.caption)
+                    Spacer()
+                    Text(model.protectionStatus).font(.caption).foregroundStyle(.secondary)
+                }
                 GroupBox {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
@@ -64,15 +76,41 @@ struct Dashboard: View {
                         ForEach(model.settings.peers) { peer in
                             Divider()
                             deviceRow(peer.name, subtitle: "\(peer.host):\(peer.port)", status: model.results[peer.id.uuidString] ?? "尚未检测")
+                                .onDrop(of: [UTType.fileURL], isTargeted: nil) { acceptFiles($0, targetID: peer.id.uuidString) }
                         }
                         ForEach(model.discovered.filter { mac in !model.settings.peers.contains { $0.id.uuidString == mac.id } }) { mac in
                             Divider()
                             deviceRow("自动发现 · \(mac.name)", subtitle: "Bonjour 局域网设备", status: model.results[mac.id] ?? "请刷新以验证组密钥")
+                                .onDrop(of: [UTType.fileURL], isTargeted: nil) { acceptFiles($0, targetID: mac.id) }
                         }
                         if model.settings.peers.isEmpty && model.discovered.isEmpty {
                             Text("到“配对与解锁”查找主控或填写 IP，主控接受后自动加入。")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
+                    }.padding(8)
+                }
+                GroupBox("文件传输") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("拖文件到设备名称发送，或拖到这里分发给全部设备", systemImage: "square.and.arrow.up.on.square")
+                            .frame(maxWidth: .infinity, minHeight: 48)
+                            .background(Color.teal.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                            .onDrop(of: [UTType.fileURL], isTargeted: nil) { acceptFiles($0, targetID: nil) }
+                        Text("接收端需开启文件接收；同名文件自动改名。目录请先压缩。")
+                            .font(.caption).foregroundStyle(.secondary)
+                        ForEach(model.transfers) { transfer in
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text(transfer.name).lineLimit(1)
+                                    Text(transfer.status).font(.caption).foregroundStyle(.secondary)
+                                    if !transfer.finished { ProgressView(value: transfer.progress) }
+                                }
+                                Spacer()
+                                if !transfer.finished { Button("取消") { model.cancelTransfer(transfer.id) } }
+                                if let file = transfer.file { Button("在 Finder 中显示") { NSWorkspace.shared.activateFileViewerSelecting([file]) } }
+                            }
+                        }
+                        Text("等待发送：\(model.queuedFileCount) 个文件任务").font(.caption)
+                        Button("清空发送队列") { model.cancelQueuedTransfers() }
                     }.padding(8)
                 }
                 GroupBox("最近事件") {
@@ -85,6 +123,25 @@ struct Dashboard: View {
                 }
             }.padding(16)
         }
+    }
+    func acceptFiles(_ providers: [NSItemProvider], targetID: String?) -> Bool {
+        guard !providers.isEmpty, providers.count <= 100 else { return false }
+        let group = DispatchGroup()
+        var files: [URL] = []
+        for provider in providers {
+            group.enter()
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                let url: URL?
+                if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
+                else { url = item as? URL }
+                DispatchQueue.main.async {
+                    if let url, url.isFileURL { files.append(url) }
+                    group.leave()
+                }
+            }
+        }
+        group.notify(queue: .main) { model.enqueueFiles(files, targetID: targetID) }
+        return true
     }
     func tile(_ title: String, value: String, icon: String) -> some View {
         VStack(alignment: .leading, spacing: 10) {

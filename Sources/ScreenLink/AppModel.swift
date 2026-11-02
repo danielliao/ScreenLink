@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import CryptoKit
 import LocalAuthentication
 import Network
 import OSLog
@@ -42,6 +43,33 @@ final class AppModel: NSObject, ObservableObject {
     @Published var lastSignalText = "尚无有效信号"
     @Published var rssi: Int?
     @Published var accessibilityGranted = ScreenControl.accessibility
+
+    @Published var protectionStatus = "准备检测活动"
+    @Published var pauseStatus = "未暂停"
+    @Published var transfers: [TransferRow] = []
+    private let inputActivity = InputActivity()
+    private var workstationPolicy = WorkstationPolicy()
+    private var relayPolicy = UnlockRelayPolicy()
+    private var pauseSnapshot = PauseSnapshot(issued: 0, until: 0)
+    private var pauseDeadline: Double = 0
+    private var pauseGroup = ""
+    private var automaticEvent: UUID?
+    private var handledAutomatic: UUID?
+    private var remoteAutomaticUntil: Double = 0
+    private var automaticRunning = false
+    private var nextWorkstationTick: Double = 0
+    private var relayDispatch: [UUID: (expires: Double, local: Bool)] = [:]
+    private var seenUnlockEvents: [UUID: Double] = [:]
+    private var cancelledAutoEvents: [UUID: Double] = [:]
+    private var automaticDeferred = false
+    private var features: [UUID: Int] = [:]
+    private let sharing = SharingService()
+    private lazy var clipboard = ClipboardSync(deviceID: settings.deviceID)
+    private var sharingConfigured = false
+    @Published var queuedFileCount = 0
+    private var fileQueue: [(URL, (String, NWEndpoint))] = [] { didSet { queuedFileCount = fileQueue.count } }
+    private var sendingFile: UUID?
+    private var featureGeneration = UUID()
 
     private let bluetooth = BluetoothMonitor()
     private let server = LinkServer()
@@ -150,7 +178,8 @@ final class AppModel: NSObject, ObservableObject {
             self.pendingSleepLock = self.settings.isCoordinator && (self.settings.autoLock || self.settings.relayManualLock)
             self.locker.cancel()
             if self.pendingSleepLock {
-                self.lockAll(reason: "主控即将休眠（唤醒后核对本机锁屏结果）")
+                self.beginAutomaticLock()
+                self.runAutomaticLock()
             }
             self.isSleeping = true
             self.cancelPendingUnlocks(); self.idle.set(false); self.remotePresenceUntil = 0
@@ -162,11 +191,12 @@ final class AppModel: NSObject, ObservableObject {
         observers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
             self.isSleeping = false
+            self.inputActivity.start()
             self.locker.cancel()
             self.presence.resume(at: self.uptime); self.remotePresenceUntil = 0
             if self.pendingSleepLock, self.settings.isCoordinator,
                self.settings.autoLock || self.settings.relayManualLock {
-                self.requestLocalLock(phoneDeparture: false)
+                self.beginAutomaticLock()
             }
             self.pendingSleepLock = false
             if self.observing {
@@ -175,6 +205,8 @@ final class AppModel: NSObject, ObservableObject {
             self.configureJoining()
             self.record("已唤醒，恢复手机检测并核对本机锁屏")
         })
+        inputActivity.start()
+        setupSharing()
         configure()
         timer = CommonModeTimer.schedule(interval: 1) { [weak self] in self?.tick() }
     }
@@ -222,6 +254,12 @@ final class AppModel: NSObject, ObservableObject {
     }
     private func configure(keepJoin: Bool = false) {
         locker.cancel(); pendingSleepLock = false
+        featureGeneration = UUID(); features.removeAll(); seenUnlockEvents.removeAll(); relayDispatch.removeAll()
+        automaticEvent = nil; handledAutomatic = nil; remoteAutomaticUntil = 0
+        workstationPolicy = WorkstationPolicy(); relayPolicy = UnlockRelayPolicy()
+        sharing.stop(); fileQueue.removeAll(); sendingFile = nil
+        configurePause()
+        clipboard.tick(enabled: false, unlocked: false)
         if !keepJoin { joinClient?.cancel() }
         configureJoining()
         cancelPendingUnlocks()
@@ -240,6 +278,7 @@ final class AppModel: NSObject, ObservableObject {
             networkStatus = settings.networkEnabled ? "缺少组密钥，请先配对" : "网络接收关闭"
             return
         }
+        do { try sharing.start(key: key, deviceID: settings.deviceID) } catch { record("共享服务未启动：\(error.localizedDescription)") }
         do { try server.start(key: key, deviceID: settings.deviceID) }
         catch { networkStatus = "监听失败：\(error.localizedDescription)"; record(networkStatus) }
         let browser = NWBrowser(for: .bonjour(type: "_screenlink._tcp", domain: nil), using: .tcp)
@@ -420,9 +459,11 @@ final class AppModel: NSObject, ObservableObject {
     private func tick() {
         guard !isSleeping else { return }
         let trusted = ScreenControl.accessibility
-        if accessibilityGranted != trusted { accessibilityGranted = trusted }
+        if accessibilityGranted != trusted { accessibilityGranted = trusted; inputActivity.start() }
         let current = ScreenControl.state
         if current == .locked { locker.observeLocked() }
+        if relayPolicy.observe(current, enabled: settings.relayUnlock == true) { relayLocalUnlock() }
+        clipboard.tick(enabled: settings.clipboardSync == true && settings.networkEnabled && hasKey, unlocked: current == .unlocked)
         if current != screen {
             let previous = screen; screen = current
             if current == .locked {
@@ -436,8 +477,12 @@ final class AppModel: NSObject, ObservableObject {
         }
         if presence.tick(at: uptime), observing {
             record("选定手机持续断连或信号低于阈值，已判定离开")
-            if settings.isCoordinator && settings.autoLock { lockAll(reason: "手机离开", phoneDeparture: true) }
+            if settings.isCoordinator && settings.autoLock { beginAutomaticLock() }
         }
+        if presence.isPresent, automaticEvent != nil {
+            clearAutomatic()
+        }
+        workstationTick(current: current)
         if isPresent != presence.isPresent { isPresent = presence.isPresent }
         let text = presence.isPresent ? "手机在场" : (presence.lastSignal == nil ? "等待首次信号" : "手机已离开")
         if presenceText != text { presenceText = text }
@@ -491,6 +536,7 @@ final class AppModel: NSObject, ObservableObject {
         }
     }
     func lockAll(reason: String = "手动锁定全部", phoneDeparture: Bool = false) {
+        clearAutomatic()
         cancelPendingUnlocks()
         suppressRelayUntil = uptime + 5
         broadcast(.lock, reason: reason)
@@ -536,6 +582,7 @@ final class AppModel: NSObject, ObservableObject {
         }
     }
     private func cancelPendingUnlocks() {
+        relayPolicy.cancelRemoteAttempt()
         unlockGeneration = UUID()
         authContext?.invalidate(); authContext = nil
         operationInProgress = false
@@ -554,9 +601,11 @@ final class AppModel: NSObject, ObservableObject {
         operationInProgress = true
         locker.cancel()
         record("手机已连接且信号达标，触发一次全部解锁")
-        if ScreenControl.state == .locked {
+        if ScreenControl.state == .locked, !unlocker.isAttempting {
+            prepareUnlockObservation()
             unlocker.attempt(enabled: settings.allowRemoteUnlock,
                 authorized: { [weak self] in self?.permits(authorization) ?? false }) { [weak self] result in
+                if ScreenControl.state != .unlocked { self?.relayPolicy.cancelRemoteAttempt() }
                 self?.record("手机连接解锁本机：\(result)")
             }
         }
@@ -591,18 +640,28 @@ final class AppModel: NSObject, ObservableObject {
     }
     private func handle(_ message: Message, reply: @escaping (Message) -> Void) {
         func respond(_ note: String) {
-            reply(Message(sender: settings.deviceID, command: .reply, responseTo: message.id,
-                          state: ScreenControl.state, note: "\(settings.deviceName)：\(note)"))
+            var response = Message(sender: settings.deviceID, command: .reply, responseTo: message.id,
+                          state: ScreenControl.state, note: "\(settings.deviceName)：\(note)")
+            response.capabilities = 1
+            response.sharingKinds = (settings.clipboardSync == true ? ["text", "png"] : []) + (settings.receiveFiles == true ? ["file"] : [])
+            if settings.isCoordinator { response.workstation = WorkstationMessage(.pauseState, pause: pauseSnapshot) }
+            reply(response)
         }
         switch message.command {
+        case .workstation:
+            guard let value = message.workstation else { respond("无效请求"); return }
+            handleWorkstation(value, sender: message.sender, sentAt: message.sentAt, respond: respond)
         case .status: respond("在线")
         case .lock:
             cancelPendingUnlocks()
             suppressRelayUntil = uptime + 5; remotePresenceUntil = 0; idle.set(false)
             ScreenControl.lock { result in self.record("收到组内锁屏：\(result)"); respond(result) }
         case .unlock:
+            guard !unlocker.isAttempting else { respond("已有解锁操作，本次不重复触发"); return }
+            if settings.allowRemoteUnlock, ScreenControl.state == .locked { prepareUnlockObservation() }
             if settings.allowRemoteUnlock { locker.cancel() }
             unlocker.attempt(enabled: settings.allowRemoteUnlock) { result in
+                if ScreenControl.state != .unlocked { self.relayPolicy.cancelRemoteAttempt() }
                 self.record("收到组内解锁：\(result)"); respond(result)
             }
         case .presence:
@@ -719,6 +778,7 @@ final class AppModel: NSObject, ObservableObject {
         } catch { alert("登录启动设置失败", error.localizedDescription) }
     }
     func shutdown() {
+        featureGeneration = UUID(); sharing.stop(); inputActivity.stop(); fileQueue.removeAll()
         locker.cancel()
         cancelPendingUnlocks()
         timer?.invalidate(); bluetooth.stop(); server.stop(); browser?.cancel(); idle.set(false)
@@ -736,5 +796,384 @@ final class AppModel: NSObject, ObservableObject {
             detail: "其他 Mac 需要重新申请加入，或导入新配对码后才能继续联动。",
             confirm: "生成新密钥", cancel: "取消") else { return }
         createGroup()
+    }
+}
+
+extension AppModel {
+    private var localIdle: Double { ScreenControl.state == .locked ? 86400 : inputActivity.idle }
+    private var paused: Bool { uptime < pauseDeadline && pauseSnapshot.remaining(at: Date().timeIntervalSince1970) > 0 }
+    private func configurePause() {
+        let group = key.map { SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined() } ?? ""
+        guard group != pauseGroup else { return }
+        if !pauseGroup.isEmpty { UserDefaults.standard.removeObject(forKey: "pause." + pauseGroup) }
+        pauseGroup = group
+        let data = UserDefaults.standard.data(forKey: "pause." + group)
+        let saved = data.flatMap { try? JSONDecoder().decode(PersistedPause.self, from: $0) }
+        pauseSnapshot = saved?.snapshot ?? PauseSnapshot(issued: 0, until: 0)
+        let restored = saved?.remaining(wall: Date().timeIntervalSince1970, uptime: uptime, boot: BootSession.id) ?? 0
+        pauseDeadline = uptime + restored
+        if settings.isCoordinator, restored == 0, pauseSnapshot.until > pauseSnapshot.issued,
+           pauseSnapshot.revision < UInt64.max {
+            let now = Date().timeIntervalSince1970
+            var resumed = PauseSnapshot(issued: now, until: now)
+            resumed.revision = pauseSnapshot.revision + 1
+            applyPause(resumed)
+        } else if !settings.isCoordinator, let saved, saved.boot != BootSession.id {
+            // A follower reacquires the coordinator's authoritative state after reboot.
+            pauseSnapshot = PauseSnapshot(issued: 0, until: 0)
+        }
+    }
+    private func applyPause(_ snapshot: PauseSnapshot) {
+        guard snapshot.revision > pauseSnapshot.revision else { return }
+        // Repeated snapshots must never renew the monotonic deadline.
+        if snapshot == pauseSnapshot { return }
+        pauseSnapshot = snapshot
+        pauseDeadline = uptime + snapshot.remaining(at: Date().timeIntervalSince1970)
+        if let data = try? JSONEncoder().encode(PersistedPause(snapshot: snapshot, deadline: pauseDeadline, boot: BootSession.id)), !pauseGroup.isEmpty {
+            UserDefaults.standard.set(data, forKey: "pause." + pauseGroup)
+        }
+        if paused, automaticRunning { locker.cancel() }
+    }
+    func pauseLock(minutes: Int) {
+        guard [0,15,30,60,120].contains(minutes) else { return }
+        if settings.isCoordinator {
+            let now = Date().timeIntervalSince1970
+            guard pauseSnapshot.revision < UInt64.max else { record("暂停序号耗尽，请重新配对"); return }
+            var snapshot = PauseSnapshot(issued: now, until: now + Double(minutes * 60))
+            snapshot.revision = pauseSnapshot.revision + 1
+            applyPause(snapshot)
+            featureBroadcast(WorkstationMessage(.pauseState, pause: pauseSnapshot))
+            record(minutes == 0 ? "已恢复自动锁屏" : "已暂停自动锁屏 \(minutes) 分钟，正在通知组内设备")
+        } else {
+            sendToCoordinator(WorkstationMessage(.pauseRequest, minutes: minutes))
+        }
+    }
+    private func clearAutomatic() {
+        if settings.isCoordinator, let event = automaticEvent { featureBroadcast(WorkstationMessage(.cancelAutomatic, event: event), quiet: true) }
+        automaticEvent = nil; handledAutomatic = nil
+        if automaticRunning { locker.cancel() }
+        workstationPolicy.pendingLock = false
+    }
+    private func beginAutomaticLock() {
+        if automaticEvent == nil { automaticEvent = UUID(); handledAutomatic = nil; workstationPolicy.pendingLock = true }
+    }
+    private func runAutomaticLock() {
+        guard let event = automaticEvent, handledAutomatic != event, !isSleeping else { return }
+        guard workstationPolicy.shouldLock(phoneAbsent: true, paused: paused, localIdle: localIdle, at: uptime) else { return }
+        if !settings.isCoordinator && uptime >= remoteAutomaticUntil { automaticEvent = nil; return }
+        handledAutomatic = event; automaticRunning = true
+        cancelPendingUnlocks(); idle.set(false); suppressRelayUntil = uptime + 12
+        locker.request(allowed: { [weak self] in
+            guard let self else { return false }
+            return self.automaticEvent == event && !self.isSleeping && !self.paused
+                && !self.workstationPolicy.protected(localIdle: self.localIdle, at: self.uptime)
+                && (self.settings.isCoordinator || self.uptime < self.remoteAutomaticUntil)
+        }) { [weak self] result in
+            guard let self else { return }
+            self.automaticRunning = false
+            if result == .cancelled { self.handledAutomatic = nil; self.workstationPolicy.pendingLock = self.automaticEvent != nil }
+            self.localLockStatus = result.note; self.record("自动锁屏：\(result.note)")
+        }
+    }
+    private func workstationTick(current: ScreenState) {
+        if settings.isCoordinator, !paused, pauseSnapshot.until > pauseSnapshot.issued { pauseLock(minutes: 0) }
+        let activity = localIdle
+        let protected = workstationPolicy.protected(localIdle: activity, at: uptime)
+        protectionStatus = !activity.isFinite ? "活动检测暂不可用，自动锁屏已暂缓" : (protected ? "鼠标 / 键盘活动保护中" : "已空闲至少 10 秒")
+        let remaining = max(0, min(pauseDeadline - uptime, pauseSnapshot.remaining(at: Date().timeIntervalSince1970)))
+        pauseStatus = remaining > 0 ? "自动锁屏暂停中 · 剩余 \(Int(ceil(remaining / 60))) 分钟" : "未暂停"
+        if protected || paused {
+            if automaticRunning { locker.cancel() }
+            if settings.isCoordinator, let event = automaticEvent, !automaticDeferred {
+                featureBroadcast(WorkstationMessage(.cancelAutomatic, event: event), quiet: true)
+                automaticEvent = UUID(); handledAutomatic = nil; workstationPolicy.pendingLock = true
+            }
+            automaticDeferred = true
+        } else { automaticDeferred = false }
+        runAutomaticLock()
+        guard uptime >= nextWorkstationTick, settings.networkEnabled, hasKey else { return }
+        nextWorkstationTick = uptime + 2
+        if settings.isCoordinator {
+            if let event = automaticEvent, !paused, !protected {
+                featureBroadcast(WorkstationMessage(.automaticLock, event: event), quiet: true)
+            }
+        } else {
+            // Unknown activity must not be reported as idle.
+            sendToCoordinator(WorkstationMessage(.activity, idle: current == .unlocked ? (activity.isFinite ? min(86400, activity) : 0) : 86400), quiet: true)
+        }
+    }
+    private func featureExchange(_ message: Message, to target: (String, NWEndpoint), quiet: Bool,
+                                 completion: @escaping (Message?) -> Void) {
+        guard settings.networkEnabled, let key else { completion(nil); return }
+        let generation = featureGeneration
+        _ = LinkRequest(endpoint: target.1, message: message, key: key) { [weak self] result in
+            guard let self, generation == self.featureGeneration else { return }
+            switch result {
+            case .success(let reply):
+                if let expected = self.knownPeerIDs[target.0], expected != reply.sender { completion(nil); return }
+                self.knownPeerIDs[target.0] = reply.sender
+                self.features[reply.sender] = reply.capabilities ?? 0
+                if !self.settings.isCoordinator, self.settings.coordinatorID == reply.sender,
+                   let snapshot = reply.workstation?.pause { self.applyPause(snapshot) }
+                if !quiet { self.results[target.0] = "\(Self.label(reply.state ?? .unknown)) · \(reply.note ?? "在线")" }
+                completion(reply)
+            case .failure(let error):
+                if !quiet { self.results[target.0] = "未确认 · \(error.localizedDescription)" }
+                completion(nil)
+            }
+        }
+    }
+    private func featureSend(_ value: WorkstationMessage, to target: (String, NWEndpoint), quiet: Bool = false) {
+        let sampledAt = uptime
+        featureExchange(Message(sender: settings.deviceID, command: .status), to: target, quiet: quiet) { [weak self] reply in
+            guard let self, let reply else { return }
+            guard reply.capabilities == 1 else {
+                if !quiet { self.results[target.0] = "请升级该设备以支持工作台联动" }; return
+            }
+            var currentValue = value
+            if value.action == .unlockRelay || value.action == .relayedUnlock {
+                guard let grant = self.relayDispatch[value.event], self.uptime < grant.expires,
+                      !grant.local || ScreenControl.state == .unlocked else { return }
+            }
+            if value.action == .automaticLock {
+                guard self.automaticEvent == value.event, !self.paused, !self.isSleeping,
+                      !self.workstationPolicy.protected(localIdle: self.localIdle, at: self.uptime) else { return }
+            }
+            if value.action == .activity, let idle = value.idle { currentValue.idle = min(86400, idle + self.uptime - sampledAt) }
+            var message = Message(sender: self.settings.deviceID, command: .workstation)
+            message.workstation = currentValue
+            self.featureExchange(message, to: target, quiet: quiet) { _ in }
+        }
+    }
+    private func featureBroadcast(_ value: WorkstationMessage, excluding: UUID? = nil, quiet: Bool = false) {
+        var sent = Set<UUID>()
+        for target in targets {
+            if let id = knownPeerIDs[target.0] {
+                if id == excluding || id == settings.deviceID || !sent.insert(id).inserted { continue }
+            }
+            featureSend(value, to: target, quiet: quiet)
+        }
+    }
+    private func sendToCoordinator(_ value: WorkstationMessage, quiet: Bool = false) {
+        guard let coordinator = settings.coordinatorID else { if !quiet { record("未配置主控，无法完成组联动") }; return }
+        // Probe candidates to authenticate identities; followers need not know routes to one another.
+        let generation = featureGeneration
+        let sampledAt = uptime
+        var sent = false
+        let candidates = targets
+        var remaining = candidates.count
+        if remaining == 0 { if !quiet { record("无法完成：没有主控连接地址") }; return }
+        for target in candidates {
+            featureExchange(Message(sender: settings.deviceID, command: .status), to: target, quiet: true) { [weak self] reply in
+                guard let self, self.featureGeneration == generation else { return }
+                remaining -= 1
+                if !sent, reply?.sender != coordinator {
+                    if remaining == 0, !quiet { self.record("无法完成：主控离线或未通过身份验证") }
+                    return
+                }
+                guard !sent, reply?.sender == coordinator else { return }
+                var current = value
+                if value.action == .activity, let idle = value.idle { current.idle = min(86400, idle + self.uptime - sampledAt) }
+                sent = true; self.featureSend(current, to: target, quiet: quiet)
+            }
+        }
+        if !quiet { record("已请求主控处理；请查看设备响应") }
+    }
+    private func relayLocalUnlock() {
+        clearAutomatic()
+        let value = WorkstationMessage(.unlockRelay)
+        relayDispatch = relayDispatch.filter { $0.value.expires > uptime }
+        relayDispatch[value.event] = (uptime + 15, true)
+        if settings.isCoordinator { performRelay(value, source: settings.deviceID) }
+        else { sendToCoordinator(value) }
+    }
+    private func performRelay(_ value: WorkstationMessage, source: UUID, expires: Double? = nil) {
+        seenUnlockEvents = seenUnlockEvents.filter { $0.value > uptime }
+        guard seenUnlockEvents[value.event] == nil, seenUnlockEvents.count < 256 else { return }
+        seenUnlockEvents[value.event] = uptime + 35
+        relayDispatch = relayDispatch.filter { $0.value.expires > uptime }
+        relayDispatch[value.event] = (expires ?? (uptime + 15), source == settings.deviceID)
+        featureBroadcast(WorkstationMessage(.relayedUnlock, event: value.event), excluding: source)
+        if source != settings.deviceID { acceptRelayedUnlock() }
+        record("已转发本机解锁联动；以各设备实际结果为准")
+    }
+    private func prepareUnlockObservation() {
+        // The receiver has already observed .locked. Synchronize the periodic
+        // observer before starting input so its next tick cannot cancel this attempt.
+        screen = .locked
+        _ = relayPolicy.observe(.locked, enabled: false)
+        relayPolicy.markRemoteAttempt()
+    }
+    private func acceptRelayedUnlock() {
+        guard settings.allowRemoteUnlock, ScreenControl.state == .locked, !unlocker.isAttempting else { return }
+        prepareUnlockObservation(); locker.cancel(); clearAutomatic()
+        unlocker.attempt(enabled: true) { [weak self] result in
+            if ScreenControl.state != .unlocked { self?.relayPolicy.cancelRemoteAttempt() }
+            self?.record("解锁联动：\(result)")
+        }
+    }
+    private func handleWorkstation(_ value: WorkstationMessage, sender: UUID, sentAt: Double, respond: (String) -> Void) {
+        switch value.action {
+        case .activity:
+            guard settings.isCoordinator, let idle = value.idle else { respond("不是主控"); return }
+            let delay = max(0, Date().timeIntervalSince1970 - sentAt)
+            workstationPolicy.activity(peer: sender, idle: idle + delay, at: uptime)
+            respond("活动状态已更新")
+        case .cancelAutomatic:
+            guard !settings.isCoordinator, sender == settings.coordinatorID else { respond("不是配置的主控"); return }
+            cancelledAutoEvents = cancelledAutoEvents.filter { $0.value > uptime }
+            if cancelledAutoEvents.count < 256 { cancelledAutoEvents[value.event] = uptime + 35 }
+            if automaticEvent == value.event { clearAutomatic() }
+            respond("已撤销自动锁屏")
+        case .automaticLock:
+            cancelledAutoEvents = cancelledAutoEvents.filter { $0.value > uptime }
+            guard cancelledAutoEvents[value.event] == nil else { respond("该自动锁屏已撤销"); return }
+            guard !settings.isCoordinator, sender == settings.coordinatorID else { respond("不是配置的主控"); return }
+            if automaticEvent != value.event { locker.cancel(); handledAutomatic = nil; workstationPolicy.pendingLock = true }
+            automaticEvent = value.event; remoteAutomaticUntil = uptime + max(0, 6 - max(0, Date().timeIntervalSince1970 - sentAt))
+            runAutomaticLock(); respond(paused ? "自动锁屏暂停中" : (inputActivity.idle < 10 ? "活动保护，稍后核对" : "已接收自动锁屏，稍后刷新实际状态"))
+        case .pauseRequest:
+            guard settings.isCoordinator, let minutes = value.minutes else { respond("不是主控"); return }
+            pauseLock(minutes: minutes); respond("暂停设置已应用，其他设备以各自确认为准")
+        case .pauseState:
+            guard !settings.isCoordinator, sender == settings.coordinatorID, let snapshot = value.pause else { respond("不是配置的主控"); return }
+            applyPause(snapshot); respond("暂停设置已同步")
+        case .unlockRelay:
+            guard settings.isCoordinator else { respond("不是主控"); return }
+            performRelay(value, source: sender, expires: uptime + max(0, 15 - max(0, Date().timeIntervalSince1970 - sentAt))); respond("已处理解锁联动")
+        case .relayedUnlock:
+            guard sender == settings.coordinatorID else { respond("不是配置的主控"); return }
+            seenUnlockEvents = seenUnlockEvents.filter { $0.value > uptime }
+            guard seenUnlockEvents[value.event] == nil, seenUnlockEvents.count < 256 else { respond("已处理"); return }
+            seenUnlockEvents[value.event] = uptime + 35
+            acceptRelayedUnlock(); respond(settings.allowRemoteUnlock ? "已请求解锁，稍后刷新实际状态" : "未启用本机实验解锁")
+        }
+    }
+}
+
+extension AppModel {
+    private func setupSharing() {
+        guard !sharingConfigured else { return }; sharingConfigured = true
+        sharing.receivePermission = { [weak self] kind, _ in
+            guard let self, self.settings.networkEnabled, self.hasKey, ScreenControl.state == .unlocked else { return false }
+            return kind == "file" ? self.settings.receiveFiles == true : self.settings.clipboardSync == true
+        }
+        sharing.destinationDirectory = { [weak self] in
+            guard let self else { return nil }
+            let directory = self.settings.receiveDirectory.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads/ScreenLink", isDirectory: true)
+            do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true); return directory }
+            catch { return nil }
+        }
+        sharing.onClipboard = { [weak self] data, kind, event, _ in
+            guard let self else { return }
+            self.clipboard.tick(enabled: self.settings.clipboardSync == true && self.settings.networkEnabled && self.hasKey,
+                                unlocked: ScreenControl.state == .unlocked)
+            _ = self.clipboard.receive(data: data, kind: kind, event: event)
+        }
+        clipboard.onCopy = { [weak self] data, kind, event in self?.sendClipboard(data, kind: kind, event: event) }
+        sharing.onTransferStarted = { [weak self] id, peer, kind, name in
+            guard let self, kind == "file", !self.transfers.contains(where: { $0.id == id }) else { return }
+            self.transfers.append(TransferRow(id: id, name: "\(name) · \(self.nameForPeer(peer))", status: "传输中"))
+        }
+        sharing.onListenerFailure = { [weak self] note in self?.record("共享服务：" + note) }
+        sharing.onProgress = { [weak self] id, peer, done, total in
+            guard let self else { return }
+            if !self.transfers.contains(where: { $0.id == id }) {
+                self.transfers.append(TransferRow(id: id, name: "来自 \(self.nameForPeer(peer)) 的文件", status: "接收中"))
+            }
+            if let index = self.transfers.firstIndex(where: { $0.id == id }) {
+                self.transfers[index].progress = total > 0 ? Double(done) / Double(total) : 0
+                self.transfers[index].status = "\(ByteCountFormatter.string(fromByteCount: done, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: total, countStyle: .file))"
+            }
+        }
+        sharing.onCompleted = { [weak self] id, _, url in
+            guard let self else { return }
+            if let index = self.transfers.firstIndex(where: { $0.id == id }) {
+                self.transfers[index].status = "已完成"; self.transfers[index].finished = true
+                self.transfers[index].progress = 1; self.transfers[index].file = url
+            }
+            if self.sendingFile == id { self.sendingFile = nil; self.startNextFile() }
+            self.trimTransfers()
+        }
+        sharing.onFailure = { [weak self] id, _, note in
+            guard let self else { return }
+            if let index = self.transfers.firstIndex(where: { $0.id == id }) {
+                self.transfers[index].status = note; self.transfers[index].finished = true
+            } else { self.record("共享未完成：\(note)") }
+            if self.sendingFile == id { self.sendingFile = nil; self.startNextFile() }
+            self.trimTransfers()
+        }
+    }
+    private func trimTransfers() {
+        while transfers.count > 100, let index = transfers.firstIndex(where: { $0.finished }) { transfers.remove(at: index) }
+    }
+    private func nameForPeer(_ id: UUID) -> String {
+        settings.peers.first(where: { $0.id == id })?.name ?? id.uuidString.prefix(8).description
+    }
+    private func shareEndpoint(_ endpoint: NWEndpoint) -> NWEndpoint? {
+        switch endpoint {
+        case .hostPort(let host, _): return .hostPort(host: host, port: 45733)
+        case .service(let name, _, let domain, let interface):
+            return .service(name: name, type: "_screenshare._tcp", domain: domain, interface: interface)
+        default: return nil
+        }
+    }
+    private func sendClipboard(_ data: Data, kind: String, event: String) {
+        guard settings.clipboardSync == true, settings.networkEnabled, ScreenControl.state == .unlocked else { return }
+        let generation = featureGeneration
+        var sent = Set<UUID>()
+        for target in targets {
+            featureExchange(Message(sender: settings.deviceID, command: .status), to: target, quiet: true) { [weak self] reply in
+                guard let self, generation == self.featureGeneration, self.settings.clipboardSync == true,
+                      ScreenControl.state == .unlocked, let reply, reply.capabilities == 1, reply.sharingKinds?.contains(kind) == true,
+                      reply.sender != self.settings.deviceID, sent.insert(reply.sender).inserted,
+                      let endpoint = self.shareEndpoint(target.1) else { return }
+                _ = self.sharing.sendData(data: data, kind: kind, event: event, to: endpoint, expectedPeer: reply.sender)
+            }
+        }
+    }
+    func enqueueFiles(_ urls: [URL], targetID: String?) {
+        guard settings.networkEnabled, hasKey, ScreenControl.state == .unlocked else { record("请先解锁本机并开启组内通信"); return }
+        guard !urls.isEmpty, urls.count <= 100 else { record("每批最多发送 100 个文件"); return }
+        let candidates = targets.filter { targetID == nil || $0.0 == targetID }
+        guard !candidates.isEmpty, fileQueue.count + urls.count * candidates.count <= 1600 else {
+            record("没有可发送的设备或队列已满"); return
+        }
+        let generation = featureGeneration
+        var verified = Set<UUID>()
+        for target in candidates {
+            featureExchange(Message(sender: settings.deviceID, command: .status), to: target, quiet: false) { [weak self] reply in
+                guard let self, generation == self.featureGeneration else { return }
+                guard let reply, reply.capabilities == 1, reply.sharingKinds?.contains("file") == true, reply.sender != self.settings.deviceID else {
+                    self.record("文件未发送：目标离线或未升级"); return
+                }
+                guard verified.insert(reply.sender).inserted else { return }
+                guard self.fileQueue.count + urls.count <= 1600 else { self.record("文件队列已满"); return }
+                self.fileQueue += urls.map { ($0, target) }; self.startNextFile()
+            }
+        }
+    }
+    private func startNextFile() {
+        guard sendingFile == nil, !fileQueue.isEmpty, settings.networkEnabled else { return }
+        let (url, target) = fileQueue.removeFirst()
+        guard let peer = knownPeerIDs[target.0], let endpoint = shareEndpoint(target.1) else { startNextFile(); return }
+        let id = sharing.sendFile(url: url, to: endpoint, expectedPeer: peer)
+        sendingFile = id
+        transfers.append(TransferRow(id: id, name: "\(url.lastPathComponent) → \(nameForPeer(peer))", status: "连接中"))
+    }
+    func cancelTransfer(_ id: UUID) { sharing.cancel(id: id) }
+    func cancelQueuedTransfers() {
+        fileQueue.removeAll()
+        if let sendingFile { sharing.cancel(id: sendingFile) }
+        record("已清空发送队列")
+    }
+    func chooseReceiveDirectory() -> String? {
+        let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
+        panel.canCreateDirectories = true; panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            return url.path
+        }
+        return nil
     }
 }

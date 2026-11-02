@@ -2,7 +2,7 @@ import Foundation
 import CryptoKit
 
 public enum ScreenState: String, Codable { case locked, unlocked, unknown }
-public enum Command: String, Codable { case status, lock, unlock, presence, reply }
+public enum Command: String, Codable { case status, lock, unlock, presence, reply, workstation }
 
 public struct Message: Codable {
     public var version = 1
@@ -13,6 +13,9 @@ public struct Message: Codable {
     public var responseTo: UUID?
     public var state: ScreenState?
     public var note: String?
+    public var capabilities: Int?
+    public var sharingKinds: [String]?
+    public var workstation: WorkstationMessage?
     public init(sender: UUID, command: Command, now: TimeInterval = Date().timeIntervalSince1970,
                 responseTo: UUID? = nil, state: ScreenState? = nil, note: String? = nil) {
         self.id = UUID(); self.sender = sender; self.command = command; self.sentAt = now
@@ -59,6 +62,8 @@ public enum Wire {
         guard message.version == 1, message.sentAt.isFinite,
               (message.note?.utf8.count ?? 0) <= 1024 else { throw ProtocolError.invalid }
         guard abs(now - message.sentAt) <= 15 else { throw ProtocolError.expired }
+        try message.workstation?.validate()
+        if message.command == .workstation && message.workstation == nil { throw ProtocolError.invalid }
         return message
     }
     public static func validateReply(_ reply: Message, to request: Message) throws {
@@ -109,6 +114,10 @@ public struct Settings: Codable {
     public var joinEnabled: Bool?
     public var allowsJoining: Bool { isCoordinator && networkEnabled && (joinEnabled ?? true) }
     public var autoLock = false
+    public var relayUnlock: Bool?
+    public var clipboardSync: Bool?
+    public var receiveFiles: Bool?
+    public var receiveDirectory: String?
     // Optional fields preserve decoding of previously installed versions.
     public var unlockOnPhoneConnection: Bool?
     public var phoneUnlockEnabled: Bool { unlockOnPhoneConnection ?? false }

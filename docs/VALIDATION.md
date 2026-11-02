@@ -4,8 +4,9 @@ Automated checks validate implementation behavior, not Bluetooth reliability or 
 
 ## Automated checks
 
-- `scripts/check.sh`: 135 core checks, including actual loopback TCP exchange, authentication/replay, framing, pairing, listener rebinding, discovery, credential setup ordering, presence and return policies; 18 event-construction checks; app compilation and plist validation.
+- `scripts/check.sh`: core checks, including actual loopback TCP exchange, authentication/replay, framing, pairing, listener rebinding, discovery, credential setup ordering, presence and return policies; 18 event-construction checks; app compilation and plist validation.
 - `scripts/check-prompts.sh`: 15 AppKit dialog/input checks on an interactive desktop.
+- `scripts/check-clipboard.sh`: isolated native clipboard tests using uniquely named fixture pasteboards.
 - `scripts/check-input.sh`: 6 synthetic SwiftUI input checks on an interactive desktop.
 - `scripts/build-app.sh`: arm64 release build, app bundle and signature verification.
 
@@ -35,3 +36,11 @@ On 2026-10-20, 117 core checks, 18 input-event checks and 15 native prompt check
 135 core checks, 18 input-event checks and 15 native prompt checks passed locally (168 total). The 18 new recovery checks exercise the production retry controller, suspended presence policy and common-mode timer with simulated state/time and no system input. Three isolated regression mutations (single-attempt locking, discarded wake deadline, default-mode timer) each fail the targeted checks; the fixed implementation passes. Debug build and plist validation passed.
 
 The coordinator sleep-notification wiring was reviewed in source. Automated checks do not suspend the host, lock the desktop, access real credentials or operate the user's other Macs. Real phone-departure locking on the coordinator and followers, wake with the phone absent, and menu-open detection still require device acceptance. The installed application is not replaced by packaging.
+
+## 0.4.0 workstation sharing — 2026-11-02
+
+New automated coverage exercises activity/pause deadlines, unlock transition suppression, authenticated workstation commands, old Settings compatibility, encrypted ephemeral sharing sessions, bounded framing, replay/tampering, no-clobber file publication, staging-entry replacement, quarantine, partial cleanup, cancellation, invalid digests and real local TCP exchanges. Clipboard policy and isolated AppKit tests cover enable/unlock baselines, simultaneous event ordering, unsampled local copies, sensitive/file types, PNG validation and duplicate suppression. Regression variants for authenticated hello replay (including JSON reformatting), staging-entry substitution, and persisted-pause extension were observed failing before corrections.
+
+The default checks do not touch the user's actual clipboard, configuration, Keychain or other Macs. Separate native clipboard checks use unique fixture pasteboards and synthetic data. Real multi-Mac manual-unlock fan-out, typing/mouse protection, group pause acknowledgements, drag-and-drop, clipboard permission behavior and network/firewall handling still require installation and device acceptance. A 2 GiB limit is tested with sparse-file metadata; this is not a sustained 2 GiB transfer benchmark. Actual disk exhaustion/quota failures and every macOS version have not been exercised. Source inspection and compilation cover UI wiring; a full live three-device UI acceptance run is not claimed.
+
+Local 0.4.0 verification: 305 core checks, 18 input-event checks, 15 native prompt checks, 22 isolated native clipboard checks and 6 synthetic input checks passed (366 total). Actual fixed-port sharing restarts and a rapid eight-reconfiguration sequence verify listener cancellation/rebinding; stopping the service mid-transfer aborts both ends and cleans staging. Debug/Release compilation and extracted-archive signature checks are required for the distributed bundle. These results do not establish the field acceptance scenarios above.

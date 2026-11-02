@@ -4,7 +4,7 @@ A native macOS menu bar app for coordinating lock screens across your own Macs, 
 
 轻量原生多 Mac 联动锁屏工具。选择一台主控，通过局域网管理自己的其他 Mac；可选 iPhone 蓝牙在场检测，无需安装 iPhone App。
 
-**当前版本：0.3.1，实验阶段。** 支持 macOS 14+；当前打包脚本面向 Apple Silicon。界面以中文为主。密码输入式解锁依赖系统权限、钥匙串访问和锁屏状态，尚未完成所有机型与系统版本的验证。
+**当前版本：0.4.0，实验阶段。** 支持 macOS 14+；当前打包脚本面向 Apple Silicon。界面以中文为主。密码输入式解锁依赖系统权限、钥匙串访问和锁屏状态，尚未完成所有机型与系统版本的验证。
 
 ## 功能
 
@@ -27,7 +27,7 @@ bash scripts/check.sh
 bash scripts/build-app.sh
 ```
 
-产物为 `dist/ScreenLink.app` 和 `dist/ScreenLink-0.3.1-arm64.zip`。退出旧版本后，将 App 放入 `/Applications` 再启动。
+产物为 `dist/ScreenLink.app` 和 `dist/ScreenLink-0.4.0-arm64.zip`。退出旧版本后，将 App 放入 `/Applications` 再启动。
 
 默认使用 ad-hoc 签名，**没有 Apple 公证**。来自下载的构建可能被 Gatekeeper 拦截；确认来源后，通过“系统设置 → 隐私与安全性 → 仍要打开”处理。请勿将 `codesign --verify` 成功等同于 Apple 公证。正式分发可使用自己的 Developer ID：
 
@@ -102,3 +102,15 @@ bash scripts/check-input.sh    # 需要交互桌面：合成 SwiftUI 输入回�
 本项目采用 [MIT License](LICENSE)，版权所有者为 danielliao。
 
 功能设计与部分系统 API 使用参考了 [BLEUnlock](https://github.com/ts1/BLEUnlock)；也调研了 [blueutil](https://github.com/toy/blueutil) 和 Apple OpenDirectory 兼容实现。没有引入其二进制、图标或第三方 Swift 包。具体来源、使用范围与上游许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。项目不代表这些上游项目或 Apple。
+
+## 工作台共享（0.4.0）
+
+请三台 Mac 都升级，在“设备与策略 → 工作台共享”分别开启所需功能，并保存设置：
+
+- **本机解锁后联动**：手动解锁任意一台，主控协调其他设备解锁。目标仍需本机密码、钥匙串和辅助功能授权；密码输入失败不自动重试。
+- **活动保护**：最近 10 秒内任意在线成员有鼠标或键盘活动，ScreenLink 暂缓自动锁屏，即使手机离开。检测不可用或安全输入期间按保护处理；不记录键值或坐标。全组空闲后重新判断。手动锁屏和系统自己的锁屏策略仍有效。
+- **暂停自动锁屏**：工作台或菜单栏可选择 15 / 30 / 60 / 120 分钟，或提前恢复。主控离线时无法完成全组暂停；设备列表显示响应。应用重启保留截止时间，主控系统重启清除旧暂停，跟随端重新向主控同步。
+- **剪贴板**：两端开启后，仅在解锁时同步新复制的文字和 PNG 图片。文字最多 1 MiB，图片最多 10 MiB / 1600 万像素；带临时/机密标记或文件引用的条目跳过。不是所有应用都会标记机密内容，因此只在可信配对组内开启。
+- **文件**：接收端开启“允许接收组内文件”，然后将普通文件拖到目标设备名称，或拖到“分发给全部设备”区域。默认保存到 `~/Downloads/ScreenLink`，可另选目录。单文件最多 2 GiB、每批最多 100 个；目录请先压缩。支持进度、取消和同名自动改名；离线/未开启接收的设备不算成功。中断后重新发送，不自动断点续传。
+
+剪贴板与文件使用独立加密传输通道（TCP 45733 / Bonjour `_screenshare._tcp`），请允许本地网络访问。旧版设备不支持新的自动锁屏保护与共享指令，会提示升级。手动基础锁屏/解锁保持兼容。当前实现继续采用组密钥信任模型，不提供组内成员之间的权限隔离。

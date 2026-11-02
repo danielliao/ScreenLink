@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 import ScreenLinkCore
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var model: AppModel!
     private var statusItem: NSStatusItem!
     private var window: NSWindow?
@@ -14,15 +14,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "lock.shield", accessibilityDescription: "ScreenLink")
         let menu = NSMenu()
+        menu.delegate = self
+        let pauseStatus = NSMenuItem(title: "未暂停", action: nil, keyEquivalent: "")
+        pauseStatus.tag = 9000; pauseStatus.isEnabled = false; menu.addItem(pauseStatus)
         item("打开 ScreenLink…", action: #selector(showWindow), in: menu)
         menu.addItem(.separator())
         item("锁定全部 Mac", action: #selector(lockAll), in: menu)
         item("认证并解锁其他 Mac…", action: #selector(unlockOthers), in: menu)
+        for minutes in [15, 30, 60, 120] {
+            let pause = NSMenuItem(title: "暂停自动锁屏 \(minutes) 分钟", action: #selector(pauseLock(_:)), keyEquivalent: "")
+            pause.tag = minutes; pause.target = self; menu.addItem(pause)
+        }
+        item("恢复自动锁屏", action: #selector(resumeLock), in: menu)
         menu.addItem(.separator())
         item("退出 ScreenLink", action: #selector(quit), in: menu)
         statusItem.menu = menu
         if !CommandLine.arguments.contains("--background") { showWindow() }
     }
+    func menuNeedsUpdate(_ menu: NSMenu) { menu.item(withTag: 9000)?.title = model.pauseStatus }
     private func item(_ title: String, action: Selector, in menu: NSMenu) {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = self; menu.addItem(item)
@@ -61,6 +70,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc func lockAll() { model.lockAll() }
     @objc func unlockOthers() { model.unlockOthers() }
+    @objc func pauseLock(_ sender: NSMenuItem) { model.pauseLock(minutes: sender.tag) }
+    @objc func resumeLock() { model.pauseLock(minutes: 0) }
     @objc func quit() { NSApp.terminate(nil) }
     func applicationWillTerminate(_ notification: Notification) { model?.shutdown() }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

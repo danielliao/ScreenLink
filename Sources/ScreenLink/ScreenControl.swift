@@ -69,6 +69,7 @@ final class ExperimentalUnlocker {
     private let logger = Logger(subsystem: "local.screenlink.app", category: "unlock")
     private var attempted = false
     private var busy = false
+    var isAttempting: Bool { busy }
     private var generation = 0
     func cancel() { generation += 1; busy = false }
     func observedUnlocked() { if !busy { attempted = false } }
